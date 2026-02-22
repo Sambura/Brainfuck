@@ -5,45 +5,58 @@ import argparse
 import numpy as np
 
 verbose_level = 0
+perchar_optimal_bf = None
+perchar_optimal_bf_lens = None
+"Precomputed optimal encodings of every value in [0;255] range"
 
-def text_to_value_list(text: str):
+def text_to_value_list(text: str) -> list[int]:
     "Convert a string to a list of ints (character values)"
     return list(map(ord, text))
 
-def signed_value_to_bf(v):
+def signed_value_to_bf(v: int) -> str:
+    "Returns v pluses for positive v and -v minuses for negative v"
     return '+' * v if v >= 0 else '-' * (-v)
 
-def value_to_bf_const(v):
+def value_to_bf_const(v: int) -> str:
     return signed_value_to_bf(v) if v < 128 else signed_value_to_bf(v - 256)
 
-def value_to_bf_mult(v):
+def signed_value_to_bf_mult(v):
     if v == 0:
-        raise Exception('Cannot convert null byte')
-    f1 = int(sqrt(v))
-    f2 = v // f1
-    rem = v - f1 * f2
-    rem2 = abs(v - f1 * (f2 + 1))
+        return ''
+
+    av = abs(v)
+    f1 = int(sqrt(av))
+    f2 = av // f1
+    rem = av - f1 * f2
+    rem2 = abs(av - f1 * (f2 + 1))
+    primary_inst = '+' if v > 0 else '-'
+    secondary_inst = '-' if v > 0 else '+'
 
     if rem <= rem2 + 1:
-        return f'>{"+" * f1}[-<{"+" * f2}>]<{"+" * rem}'
+        return f'>{"+" * f1}[-<{primary_inst * f2}>]<{primary_inst * rem}'
 
-    return f'>{"+" * f1}[-<+{"+" * f2}>]<{"-" * rem2}'
+    return f'>{"+" * f1}[-<{primary_inst * (f2 + 1)}>]<{secondary_inst * rem2}'
 
-def value_to_bf_optimal(v):
+def value_to_bf_optimal(v: int) -> str:
     # for values below 16 sequence of pluses is the same or often more efficient than multiplication-based representations
     # for 15 these are the same:
     #   +++++++++++++++
     #   <+++[->+++++<]>
-    # the second part of the condition was not factually confirmed (v > 240 part)
     if v < 16 or v > 240:
         return value_to_bf_const(v)
 
-    return value_to_bf_mult(v)
+    return signed_value_to_bf_mult(v if v < 128 else v - 256)
 
-def string_to_bf_perchar(text: str, method):
-    bf = '>'
-    bf += '>'.join(method(c) for c in text)
-    return bf
+def precompute_optimal_encodings():
+    global perchar_optimal_bf, perchar_optimal_bf_lens
+
+    if perchar_optimal_bf is not None: return
+
+    perchar_optimal_bf = [value_to_bf_optimal(x) for x in range(256)]
+    perchar_optimal_bf_lens = np.array([len(x) for x in perchar_optimal_bf], dtype=np.int32)
+
+def values_to_bf_perchar(values: list[int], method):
+    return ''.join(f'>{method(v)}' for v in values)
 
 def compress(bf: str):
     "The most basic form of BF program compression"
@@ -67,10 +80,12 @@ def get_optimal_factor(value, factor):
 def string_to_bf_segmented(text: list[int]):
     fn_start_time = perf_counter()
 
-    base_conversion = ['>' + value_to_bf_optimal(c) for c in text]
+    precompute_optimal_encodings()
+    text_size = len(text)
+    base_conversion = ['>' + perchar_optimal_bf[c] for c in text]
     if verbose > 0: 
-        print(f'Calculated base conversion: {len(base_conversion)} characters; total {sum([len(x) for x in base_conversion])} ' +
-              f'instructions (avg {sum([len(x) for x in base_conversion]) / len(base_conversion):0.2f})')
+        print(f'Calculated base conversion: {text_size} characters; total {sum([len(x) for x in base_conversion])} ' +
+              f'instructions (avg {np.mean([len(x) for x in base_conversion]):0.2f})')
         start_time = perf_counter()
 
     # precompute assets
@@ -80,33 +95,37 @@ def string_to_bf_segmented(text: list[int]):
     tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda fr: fr[1] == 0, x[i:])) for i in range(len(x))] for x in optimal_factors])
     optimal_factors = np.array([list(zip(*x)) for x in optimal_factors], dtype=np.int16)
 
-    uncompressed_size_sums = np.zeros(len(text) + 1, dtype=np.int64)
+    uncompressed_size_sums = np.zeros(text_size + 1, dtype=np.int64)
     uncompressed_size_sums[1:] = np.cumsum([len(x) for x in base_conversion])
-    character_sums = np.zeros(len(text) + 1, dtype=np.int64)
+    character_sums = np.zeros(text_size + 1, dtype=np.int64)
     character_sums[1:] = np.cumsum(text)
 
     if verbose > 0:
         print(f'Preprocessing took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
 
-    segments = []
+    segment_map = [[{'code': c, 'score': 0, 'start_index': i, 'size': 1}] for i, c in enumerate(base_conversion)]
+    segment_count = text_size
+
+    def avg_score(segment):
+        return segment['score'] / segment['size']
 
     # try making segments for every character except for last (since it has no one to group with; segments only go left->right)
-    for index in range(len(text) - 1):
-        for last_index in range(index + 1, len(text)):
+    for index in range(text_size - 1):
+        for last_index in range(index + 1, text_size):
             segment_size = last_index - index + 1
             uncompressed_size = uncompressed_size_sums[last_index + 1] - uncompressed_size_sums[index]
 
             # segments wouldn't make sense for common factor of 1
             max_factor = min(128, ceil((character_sums[last_index + 1] - character_sums[index]) / segment_size))
-            p_factors = np.arange(2, max_factor, dtype=np.int32)
-            init_code_sizes = 1 + segment_size + p_factors
+            init_code_sizes = 1 + segment_size + perchar_optimal_bf_lens[2:max_factor] # p_factors
             factor_sums_l = factor_sums[:max_factor - 2]
             remainder_sums_l = remainder_sums[:max_factor - 2]
             tailing_zeros_l = tailing_zeros[:max_factor - 2]
             loop_code_sizes = 3 + 2 * segment_size + factor_sums_l[:, last_index + 1] - factor_sums_l[:, index]
             leading_zeros = np.minimum(tailing_zeros_l[:, index], segment_size - 1)
-            remainder_code_sizes = 1 + 2 * (segment_size - leading_zeros - 1) + remainder_sums_l[:, last_index + 1] - remainder_sums_l[:, index]
+            return_shifts = segment_size - 1 - leading_zeros
+            remainder_code_sizes = segment_size - leading_zeros + np.minimum(return_shifts, 4) + remainder_sums_l[:, last_index + 1] - remainder_sums_l[:, index]
             segment_code_sizes = init_code_sizes + loop_code_sizes + remainder_code_sizes
             segment_scores = uncompressed_size - segment_code_sizes
             best_index = np.argmax(segment_scores)
@@ -114,17 +133,18 @@ def string_to_bf_segmented(text: list[int]):
 
             best_segment = {
                 'score': segment_score, 
-                'data': (p_factors[best_index], optimal_factors[best_index, 0, index:last_index + 1], optimal_factors[best_index, 1, index:last_index + 1]),
-                'avg_score': segment_score / segment_size,
-                'size': segment_size,
-                'start_index': index
+                'factor': best_index + 2,
+                'start_index': index,
+                'size': segment_size
+                # 'code_size': segment_code_sizes[best_index] # for debug purposes
             }
 
             if segment_score > 0:
                 if verbose > 3:
                     print(f'Adding a new segment: [{index};{last_index}] "{"".join(map(chr, text[index:last_index + 1]))}" (length: {segment_size}), ' +
-                          f'score: {best_segment["score"]} (avg {best_segment["avg_score"]})')
-                segments.append(best_segment)
+                          f'score: {best_segment["score"]} (avg {avg_score(best_segment)})')
+                segment_map[index].append(best_segment)
+                segment_count += 1
             else:
                 if verbose > 3:
                     print(f'Failed to make a good segment: [{index};{last_index}] (length: {segment_size}; score: {best_segment["score"]})')
@@ -132,23 +152,16 @@ def string_to_bf_segmented(text: list[int]):
                 if best_segment['score'] < 0:
                     break
 
-    # now we need to arrange segments in the best way
-
-    # put segments in index map: segment_map[0] gives segments that start at character 0, etc.
-    segment_map = [[s for s in segments if s['start_index'] == index] for index in range(len(text))]
-    # add base_conversion into segment_map
-    for i, c in enumerate(base_conversion):
-        segment_map[i].append({'code': c, 'size': 1, 'score': 0, 'avg_score': 0, 'start_index': i})
-
     if verbose > 0:
-        print(f'Segment building took {perf_counter() - start_time:0.2f}s')
-        print(f'Built {np.sum([len(x) for x in segment_map])} segments')
+        print(f'Built {segment_count} segments. Segment building took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
+
+    # now we need to arrange segments in the best way
 
     def build_best_sequence_dp():
         sequences, scores = [[]], [0]
     
-        for target_index in range(len(text)):
+        for target_index in range(text_size):
             current_score = scores[-1]
             current_sequence = []
 
@@ -176,31 +189,37 @@ def string_to_bf_segmented(text: list[int]):
 
         if verbose > 1:
             for segment in best_sequence:
-                index = segment['start_index']
-                last_index = segment['size'] + index - 1
+                index, size = segment['start_index'], segment['size']
+                last_index = size + index - 1
                 print(f'Segment: [{index};{last_index}] "{"".join(map(chr, text[index:last_index + 1]))}"; ' +
-                      f'score: {segment["score"]} (avg {segment["avg_score"]:0.2f})')
+                      f'score: {segment["score"]} (avg {avg_score(segment):0.2f})')
 
         print(f'Segment assembly took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
 
     program_segments = []
     for segment in best_sequence:
-        segment_size = segment['size']
+        start_index, segment_size = segment['start_index'], segment['size']
         
         if segment_size == 1:
             program_segments.append(segment['code'])
             continue
 
-        factor, factors, remainders = segment['data']
+        factor = segment['factor']
+        factor_index, end_index = factor - 2, start_index + segment_size
+        factors, remainders = optimal_factors[factor_index, 0, start_index:end_index], optimal_factors[factor_index, 1, start_index:end_index]
 
-        init_code = '>' + '>' * segment_size + '+' * factor
+        init_code = '>' + '>' * segment_size + perchar_optimal_bf[factor]
         loop_code = '[-' + ''.join(['<' + '+' * f for f in factors[::-1]]) + '>' * segment_size + ']'
 
         leading_zeros = sum(1 for _ in takewhile(lambda x: x == 0, remainders[:-1]))
         remainder_code = ''.join(['<' + signed_value_to_bf(r) for r in remainders[leading_zeros:][::-1]])
-        return_code = (len(remainders) - leading_zeros - 1) * '>'
+        return_shifts = len(remainders) - leading_zeros - 1
+        return_code = return_shifts * '>' if return_shifts <= 4 else '[>]<'
         segment_code = init_code + loop_code + remainder_code + return_code
+
+        # for debug purposes
+        # assert len(segment_code) == segment['code_size'], f'precomputed {segment["code_size"]} vs. actual {len(segment_code)}'
 
         program_segments.append(segment_code)
 
@@ -217,19 +236,21 @@ def convert_data_to_bf_in_memory(input_data, algo='segmented'):
     if algo == 'segmented':
         program = string_to_bf_segmented(input_data)
     elif algo == 'perchar':
-        program = string_to_bf_perchar(input_data, value_to_bf_optimal)
+        program = values_to_bf_perchar(input_data, value_to_bf_optimal)
     elif algo == 'basic':
-        program = string_to_bf_perchar(input_data, value_to_bf_const)
+        program = values_to_bf_perchar(input_data, value_to_bf_const)
     else:
         raise Exception(f'Unknown algo: {algo}')
 
     return program + '[<]>[.>]'
 
-def print_program(program, input_len, name='default'):
+def print_program(program, input_len, no_program, name='default'):
     program = compress(program)
     base_size = len(program)
 
-    print(f'Resulting program ({name}): \n\n{program}')
+    if not no_program:
+        print(f'Resulting program ({name}): \n\n{program}')
+
     print(f'\nBase program size: {base_size} instructions (avg: {base_size / input_len:0.2f} inst/char)')
 
 def main():
@@ -255,6 +276,7 @@ def main():
     parser.add_argument('--algo', '-a', choices=['segmented', 'perchar', 'basic'], default=[], action='append', help='Conversion algorithm (multiple allowed)')
     parser.add_argument('--mode', '-m', choices=['just-print', 'in-memory'], default='in-memory', help='Program type to generate')
     parser.add_argument('--preset', type=int, help=f'Use a preset string as input. Presets available: {len(input_presets)}')
+    parser.add_argument('--no-program', action='store_true', help='Do not output resulting program, only debug messages')
 
     args = parser.parse_args()
     verbose = args.verbose
@@ -296,7 +318,7 @@ def main():
     
     # print the results
     for program, algo in programs:
-        print_program(program, len(input_data), algo)
+        print_program(program, len(input_data), args.no_program, algo)
 
 if __name__ == "__main__":
     main()
