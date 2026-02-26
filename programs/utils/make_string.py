@@ -128,53 +128,53 @@ def string_to_bf_segmented(text: list[int]):
         start_time = perf_counter()
 
     # precompute assets
-    optimal_factors = [[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)] # [[(f, r), (f, r), ...], [], [], ...]
-    factor_sums = np.array([[sum([f for f, r in x[:i]]) for i in range(len(x) + 1)] for x in optimal_factors])
-    remainder_sums = np.array([[sum([abs(r) for f, r in x[:i]]) for i in range(len(x) + 1)] for x in optimal_factors])
-    tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda fr: fr[1] == 0, x[i:])) for i in range(len(x))] for x in optimal_factors])
-    # offsets: for each factor, how many steps away is the next zero?
-    zero_factor_offsets = np.array([[sum(1 for _ in takewhile(lambda fr: fr[0] != 0, x[i:])) for i in range(len(x))] for x in optimal_factors])
-    zero_factor_offsets[zero_factor_offsets < 3] += 1
-    optimal_factors = [list(zip(*x)) for x in optimal_factors]
-    # precomputed_escapes: minimum number of instructions required to reach the respective factor (not the counter!) from the first factor (reach == walk over it or stop on it)
+    optimal_factors = np.array([[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)]) # (126, text_size, 2)
+    factor_range = optimal_factors.shape[0]
+    factor_sums = np.zeros((factor_range, text_size + 1), dtype=np.int64)
+    factor_sums[:, 1:] = np.cumsum(optimal_factors[:, :, 0], axis=1)
+    remainder_sums = np.zeros((factor_range, text_size + 1), dtype=np.int64)
+    remainder_sums[:, 1:] = np.cumsum(np.abs(optimal_factors[:, :, 1]), axis=1)
+    tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda r: r == 0, x[i:, 1])) for i in range(len(x))] for x in optimal_factors])
     if text_size > 4:
         precomputed_escapes = np.zeros_like(tailing_zeros)
         precomputed_escape_starts = np.zeros_like(tailing_zeros)
-        escape_ramp = np.arange(1, 4)
+        escape_ramp = np.arange(1, 4) - 5
     
         for factor_index in range(128 - 2):
-            offsets = zero_factor_offsets[factor_index]
+            l_factors = optimal_factors[factor_index, :, 0].tolist()
             pes = precomputed_escapes[factor_index]
             pess = precomputed_escape_starts[factor_index]
-            e_index, escape_size = 0, 0
+            escape_size = 0
+            since_last_zero = 0
+            glider_reset = False
 
-            while e_index + 1 < text_size:
-                new_offset = offsets[e_index]
-                escape_size += min(new_offset, 3)
-                s_index = e_index + 1
-                last_escape = pes[e_index]
-                delta = escape_size - last_escape
-                e_index += new_offset
+            for i, factor in enumerate(l_factors):
+                pes[i] = escape_size
+                pess[i] = escape_size - 1
 
-                pes[s_index:e_index + 1] = escape_size
-                pess[s_index:e_index + 1] = escape_size
+                if factor == 0:
+                    escape_size += 1
+                    since_last_zero = 0
+                elif since_last_zero < 3:
+                    escape_size += 1
+                    since_last_zero += 1
+                elif since_last_zero < 4:
+                    since_last_zero = 4
 
-                if delta > 0 and last_escape < escape_size:
-                    delta = min(delta, text_size - s_index)
-                    pes[s_index:s_index + delta] = np.minimum(last_escape + np.arange(1, delta + 1), escape_size)
-                    pess[s_index:s_index + delta] = pes[s_index:s_index + delta]
+                # glider=T: escape_size - 3
+                # glider=F,F,F,T: escape_size - 3 for 3? elements prior first glider
+                # glider=T,F,F,F: escape_size + escape_ramp ending at last glider
+                # everywhere: -1, to account for glider reset/counter shift at the end of the range
 
-                if new_offset > 3: # a glider=True is generated starting at s_index + 2
-                    escape_start_value = escape_size - 3
-                    pess[s_index - 1:e_index - 2] = escape_start_value
-                    # the last glider=True is generated at e_index
-                    if e_index < text_size:
-                        # this makes last 2-3 elements to generate wrong, but they are unused anyway
-                        pess[e_index - 2:e_index + 1] = escape_start_value + escape_ramp
-
-        precomputed_escape_starts -= 1
-
-###
+                if since_last_zero == 4:
+                    since_last_zero += 1
+                    pess[i - 3: i + 1] = escape_size - 4
+                    glider_reset = True
+                elif since_last_zero > 4:
+                    pess[i] = escape_size - 4
+                elif glider_reset: # current index is the last glider
+                    glider_reset = False
+                    pess[i - 2:i + 1] = escape_size + escape_ramp
 
     def get_glide_code_size(distance):
         overflows = distance // 255
@@ -309,8 +309,8 @@ def string_to_bf_segmented(text: list[int]):
 
         factor = segment['factor']
         factor_index, end_index = factor - 2, start_index + segment_size
-        factors: list[int] = optimal_factors[factor_index][0][start_index:end_index]
-        remainders: list[int] = optimal_factors[factor_index][1][start_index:end_index]
+        factors: list[int] = optimal_factors[factor_index, start_index:end_index, 0].tolist()
+        remainders: list[int] = optimal_factors[factor_index, start_index:end_index, 1].tolist()
 
         travel_distance = segment_size
         engage_code = '>'
