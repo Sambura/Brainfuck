@@ -3,6 +3,9 @@ from itertools import takewhile
 from time import perf_counter
 import argparse
 import numpy as np
+import random
+
+from interpreter import bf_execute
 
 verbose_level = 0
 perchar_optimal_bf = None
@@ -58,6 +61,10 @@ def precompute_optimal_encodings():
 def values_to_bf_perchar(values: list[int], method):
     return ''.join(f'>{method(v)}' for v in values)
 
+def values_to_text(values: list[int], escape_controls=True):
+    text = ''.join(map(chr, values))
+    return text.replace('\n', '\\n').replace('\r', '\\r') if escape_controls else text
+
 def compress(bf: str):
     "The most basic form of BF program compression"
     last_len, new_len = len(bf), 0
@@ -68,14 +75,46 @@ def compress(bf: str):
     
     return bf
 
-def get_optimal_factor(value, factor):
+def get_optimal_factor(value: int, factor: int) -> tuple[int, int]:
     "returns (optimal_factor, remainder)"
     f1 = value // factor
     f2 = f1 + 1
     rem1 = value - factor * f1
     rem2 = value - factor * f2
 
-    return (f1, rem1) if f1 + rem1 < f2 + abs(rem2) else (f2, rem2)
+    return (f1, rem1) if (f1 + rem1 < f2 + abs(rem2) or f2 * factor > 255) else (f2, rem2)
+
+def verify_program(program: str, expected_output: list[int], return_details=False) -> bool:
+    start_time = perf_counter()
+    try:
+        output = bf_execute(program, [])
+    except:
+        print('Encountered error during verification')
+        return False
+
+    end_time = perf_counter()
+    if verbose > 0:
+        print(f'Verification took {1000 * (perf_counter() - start_time):0.1f}ms')
+
+    result = len(expected_output) == len(output) and np.all([x == y for x, y in zip(expected_output, output)])
+
+    return (result, output) if return_details else result
+
+def generate_test_input():
+    length = random.randrange(5, 500)
+
+    if random.randrange(0, 2) < 1:
+        # just random (except null bytes)
+        return (np.random.rand(length) * 254 + 1).astype(int).tolist()
+
+    # these are mostly arbitrary
+    ctl = np.random.rand(length) * 54 + 10
+    caps = np.random.rand(length) * 32 + 65
+    lets = np.random.rand(length) * 29 + 96
+    it1 = np.where(np.random.rand(length) < 0.8, lets, caps)
+    it2 = np.where(np.random.rand(length) < 0.92, it1, ctl)
+
+    return it2.astype(int).tolist()
 
 def string_to_bf_segmented(text: list[int]):
     fn_start_time = perf_counter()
@@ -89,22 +128,72 @@ def string_to_bf_segmented(text: list[int]):
         start_time = perf_counter()
 
     # precompute assets
-    optimal_factors = [[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)]
+    optimal_factors = [[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)] # [[(f, r), (f, r), ...], [], [], ...]
     factor_sums = np.array([[sum([f for f, r in x[:i]]) for i in range(len(x) + 1)] for x in optimal_factors])
     remainder_sums = np.array([[sum([abs(r) for f, r in x[:i]]) for i in range(len(x) + 1)] for x in optimal_factors])
     tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda fr: fr[1] == 0, x[i:])) for i in range(len(x))] for x in optimal_factors])
-    optimal_factors = np.array([list(zip(*x)) for x in optimal_factors], dtype=np.int16)
+    # offsets: for each factor, how many steps away is the next zero?
+    zero_factor_offsets = np.array([[sum(1 for _ in takewhile(lambda fr: fr[0] != 0, x[i:])) for i in range(len(x))] for x in optimal_factors])
+    zero_factor_offsets[zero_factor_offsets < 3] += 1
+    optimal_factors = [list(zip(*x)) for x in optimal_factors]
+    # precomputed_escapes: minimum number of instructions required to reach the respective factor (not the counter!) from the first factor (reach == walk over it or stop on it)
+    if text_size > 4:
+        precomputed_escapes = np.zeros_like(tailing_zeros)
+        precomputed_escape_starts = np.zeros_like(tailing_zeros)
+        escape_ramp = np.arange(1, 4)
+    
+        for factor_index in range(128 - 2):
+            offsets = zero_factor_offsets[factor_index]
+            pes = precomputed_escapes[factor_index]
+            pess = precomputed_escape_starts[factor_index]
+            e_index, escape_size = 0, 0
 
-    uncompressed_size_sums = np.zeros(text_size + 1, dtype=np.int64)
-    uncompressed_size_sums[1:] = np.cumsum([len(x) for x in base_conversion])
-    character_sums = np.zeros(text_size + 1, dtype=np.int64)
-    character_sums[1:] = np.cumsum(text)
+            while e_index + 1 < text_size:
+                new_offset = offsets[e_index]
+                escape_size += min(new_offset, 3)
+                s_index = e_index + 1
+                last_escape = pes[e_index]
+                delta = escape_size - last_escape
+                e_index += new_offset
+
+                pes[s_index:e_index + 1] = escape_size
+                pess[s_index:e_index + 1] = escape_size
+
+                if delta > 0 and last_escape < escape_size:
+                    delta = min(delta, text_size - s_index)
+                    pes[s_index:s_index + delta] = np.minimum(last_escape + np.arange(1, delta + 1), escape_size)
+                    pess[s_index:s_index + delta] = pes[s_index:s_index + delta]
+
+                if new_offset > 3: # a glider=True is generated starting at s_index + 2
+                    escape_start_value = escape_size - 3
+                    pess[s_index - 1:e_index - 2] = escape_start_value
+                    # the last glider=True is generated at e_index
+                    if e_index < text_size:
+                        # this makes last 2-3 elements to generate wrong, but they are unused anyway
+                        pess[e_index - 2:e_index + 1] = escape_start_value + escape_ramp
+
+        precomputed_escape_starts -= 1
+
+###
+
+    def get_glide_code_size(distance):
+        overflows = distance // 255
+        rest = distance - overflows * 255
+        overflow_size = 8 + 3 * overflows if overflows > 0 else 0
+        return overflow_size + min(rest, 10 + perchar_optimal_bf_lens[rest])
+
+    uncompressed_size_sums = [0] + np.cumsum([len(x) for x in base_conversion]).tolist()
+    character_sums = [0] + np.cumsum(text).tolist()
+    glide_code_sizes = list(map(get_glide_code_size, range(text_size + 1)))
 
     if verbose > 0:
         print(f'Preprocessing took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
 
-    segment_map = [[{'code': c, 'score': 0, 'start_index': i, 'size': 1}] for i, c in enumerate(base_conversion)]
+    # segment_map[start_index][end_index] = segment
+    segment_map = [[None] * text_size for _ in range(text_size)]
+    for i, c in enumerate(base_conversion):
+        segment_map[i][i] = {'code': c, 'score': 0, 'start_index': i, 'size': 1}
     segment_count = text_size
 
     def avg_score(segment):
@@ -117,15 +206,21 @@ def string_to_bf_segmented(text: list[int]):
             uncompressed_size = uncompressed_size_sums[last_index + 1] - uncompressed_size_sums[index]
 
             # segments wouldn't make sense for common factor of 1
-            max_factor = min(128, ceil((character_sums[last_index + 1] - character_sums[index]) / segment_size))
-            init_code_sizes = 1 + segment_size + perchar_optimal_bf_lens[2:max_factor] # p_factors
+            max_factor = max(3, min(128, ceil((character_sums[last_index + 1] - character_sums[index]) / segment_size)))
+            init_code_sizes = 1 + glide_code_sizes[segment_size] + perchar_optimal_bf_lens[2:max_factor]
             factor_sums_l = factor_sums[:max_factor - 2]
             remainder_sums_l = remainder_sums[:max_factor - 2]
             tailing_zeros_l = tailing_zeros[:max_factor - 2]
-            loop_code_sizes = 3 + 2 * segment_size + factor_sums_l[:, last_index + 1] - factor_sums_l[:, index]
+
+            if segment_size > 4:
+                escape_code_sizes = precomputed_escapes[:max_factor - 2, last_index] - precomputed_escape_starts[:max_factor - 2, index]
+            else:
+                escape_code_sizes = np.ones_like(init_code_sizes) * segment_size
+
+            loop_code_sizes = 3 + segment_size + escape_code_sizes + factor_sums_l[:, last_index + 1] - factor_sums_l[:, index]
             leading_zeros = np.minimum(tailing_zeros_l[:, index], segment_size - 1)
-            return_shifts = segment_size - 1 - leading_zeros
-            remainder_code_sizes = segment_size - leading_zeros + np.minimum(return_shifts, 4) + remainder_sums_l[:, last_index + 1] - remainder_sums_l[:, index]
+            return_shifts = np.minimum(segment_size - 1 - leading_zeros, 4)
+            remainder_code_sizes = segment_size - leading_zeros + return_shifts + remainder_sums_l[:, last_index + 1] - remainder_sums_l[:, index]
             segment_code_sizes = init_code_sizes + loop_code_sizes + remainder_code_sizes
             segment_scores = uncompressed_size - segment_code_sizes
             best_index = np.argmax(segment_scores)
@@ -135,15 +230,23 @@ def string_to_bf_segmented(text: list[int]):
                 'score': segment_score, 
                 'factor': best_index + 2,
                 'start_index': index,
-                'size': segment_size
-                # 'code_size': segment_code_sizes[best_index] # for debug purposes
+                'size': segment_size,
+                # for debug purposes
+                # 'code_size': segment_code_sizes[best_index],
+                # 'breakdown': {
+                #     'init': init_code_sizes[best_index],
+                #     'escape': escape_code_sizes[best_index],
+                #     'loop': loop_code_sizes[best_index] - escape_code_sizes[best_index],
+                #     'return': return_shifts[best_index],
+                #     'rems': remainder_code_sizes[best_index] - return_shifts[best_index],
+                # }
             }
 
             if segment_score > 0:
                 if verbose > 3:
-                    print(f'Adding a new segment: [{index};{last_index}] "{"".join(map(chr, text[index:last_index + 1]))}" (length: {segment_size}), ' +
-                          f'score: {best_segment["score"]} (avg {avg_score(best_segment)})')
-                segment_map[index].append(best_segment)
+                    print(f'Adding a new segment (best_index: {best_index}): [{index};{last_index}] "{values_to_text(text[index:last_index + 1])}" ' +
+                          f'(length: {segment_size}), score: {best_segment["score"]} (avg {avg_score(best_segment)})')
+                segment_map[index][last_index] = best_segment
                 segment_count += 1
             else:
                 if verbose > 3:
@@ -162,13 +265,12 @@ def string_to_bf_segmented(text: list[int]):
         sequences, scores = [[]], [0]
     
         for target_index in range(text_size):
-            current_score = scores[-1]
-            current_sequence = []
+            current_score = -1
+            current_sequence = None
 
-            # look for segment starting at base and ending at new_index that are better than what we have already
-            for base in range(0, target_index + 1):
-                # there should only be 1 or 0 matching segments
-                matching_segment = next((s for s in segment_map[base] if s['size'] == target_index - base + 1), None)
+            # look for segment starting at base and ending at target_index that are better than what we have already
+            for base in range(target_index + 1):
+                matching_segment = segment_map[base][target_index]
                 if matching_segment is None: continue
 
                 # figure out resulting score with new segment
@@ -185,13 +287,13 @@ def string_to_bf_segmented(text: list[int]):
     best_sequence = build_best_sequence_dp()
 
     if verbose > 0:
-        print(f'Assembled {len(best_sequence)} segments in sequence')
+        print(f'Assembled {len(best_sequence)} segments in sequence (total score: {sum([x["score"] for x in best_sequence])})')
 
         if verbose > 1:
             for segment in best_sequence:
                 index, size = segment['start_index'], segment['size']
                 last_index = size + index - 1
-                print(f'Segment: [{index};{last_index}] "{"".join(map(chr, text[index:last_index + 1]))}"; ' +
+                print(f'Segment: [{index};{last_index}] "{values_to_text(text[index:last_index + 1])}"; ' +
                       f'score: {segment["score"]} (avg {avg_score(segment):0.2f})')
 
         print(f'Segment assembly took {perf_counter() - start_time:0.2f}s')
@@ -207,10 +309,45 @@ def string_to_bf_segmented(text: list[int]):
 
         factor = segment['factor']
         factor_index, end_index = factor - 2, start_index + segment_size
-        factors, remainders = optimal_factors[factor_index, 0, start_index:end_index], optimal_factors[factor_index, 1, start_index:end_index]
+        factors: list[int] = optimal_factors[factor_index][0][start_index:end_index]
+        remainders: list[int] = optimal_factors[factor_index][1][start_index:end_index]
 
-        init_code = '>' + '>' * segment_size + perchar_optimal_bf[factor]
-        loop_code = '[-' + ''.join(['<' + '+' * f for f in factors[::-1]]) + '>' * segment_size + ']'
+        travel_distance = segment_size
+        engage_code = '>'
+
+        while travel_distance > 0:
+            if travel_distance >= 255:
+                overflow_count = travel_distance // 255
+                engage_code += f'-[[-{">" * overflow_count}+{"<" * overflow_count}]{">" * overflow_count}-]'
+                travel_distance -= 255 * overflow_count
+            # 30 is the first number that has optimal representation that is 10+ instructions more efficient than basic;
+            # since glider has overhead of 10 instructions, we need to have at least 10 spare to use it effectively
+            elif travel_distance >= 30:
+                engage_code += perchar_optimal_bf[travel_distance] + '[[->+<]>-]'
+                break
+            else:
+                engage_code += '>' * travel_distance
+                break
+
+        init_code = engage_code + perchar_optimal_bf[factor]
+
+        # make code to end loop, should be equivalent to '>' * segment_size
+        # can be replaced with [>]< unless segment_size is below 4 or there are zeros in `factors`
+        loop_escape_code = ''
+        current_shift = 0
+        while current_shift < segment_size:
+            if 0 not in factors[current_shift:]:
+                remaining_distance = segment_size - current_shift
+                loop_escape_code += '[>]<' if remaining_distance > 4 else '>' * remaining_distance
+                break
+
+            first_zero = factors.index(0, current_shift)
+            zero_distance = first_zero - current_shift
+            loop_escape_code += '[>]' if zero_distance > 3 else '>' * zero_distance
+            loop_escape_code += '>'
+            current_shift = first_zero + 1
+
+        loop_code = '[' + ''.join(['<' + '+' * f for f in factors[::-1]]) + loop_escape_code + '-]'
 
         leading_zeros = sum(1 for _ in takewhile(lambda x: x == 0, remainders[:-1]))
         remainder_code = ''.join(['<' + signed_value_to_bf(r) for r in remainders[leading_zeros:][::-1]])
@@ -218,8 +355,13 @@ def string_to_bf_segmented(text: list[int]):
         return_code = return_shifts * '>' if return_shifts <= 4 else '[>]<'
         segment_code = init_code + loop_code + remainder_code + return_code
 
-        # for debug purposes
-        # assert len(segment_code) == segment['code_size'], f'precomputed {segment["code_size"]} vs. actual {len(segment_code)}'
+        # if we save code_size, ensure it matches with actual generated program
+        if 'code_size' in segment and len(segment_code) != segment['code_size']:
+            print(f'Segment size mismatch: [{start_index}:{start_index + segment_size - 1}] precomputed {segment["code_size"]} vs. actual {len(segment_code)}')
+            print(f'Precomputed breakdown: ' + ', '.join([f'{key}: {size}' for key, size in segment['breakdown'].items()]))
+            print(f'Generated segment code: {segment_code}')
+
+            raise Exception('Segment code mismatch')
 
         program_segments.append(segment_code)
 
@@ -229,6 +371,40 @@ def string_to_bf_segmented(text: list[int]):
         print(f'Code generation took {perf_counter() - start_time:0.2f}s. Total time elapsed: {perf_counter() - fn_start_time:0.2f}s')
 
     return program
+
+def run_self_test(program_generator, args, run_count=250) -> bool:
+    print(f'Executing self test: {run_count} runs with args: {args}')
+
+    start_time = perf_counter()
+    exception = None
+    for _ in range(run_count):
+        test_input = generate_test_input()
+        try:
+            test_program = program_generator(test_input, *args)
+            ok, test_output = verify_program(test_program, test_input, return_details=True)
+        except Exception as e:
+            ok = False
+            test_output = []
+            test_program = ''
+            exception = e
+            print(f'\nHalting self test due to exception: {e}\n')
+
+        if not ok:
+            print(f'Self test failed. Test input was: ({len(test_input)}) {test_input}')
+            print(f'Or:\n\n{values_to_text(test_input)}\n')
+            print(f'Test output was: {test_output}')
+            print(f'Or:\n\n{values_to_text(test_output)}\n')
+            print(f'Program generated for input: {test_program}')
+
+            if exception is not None:
+                print('Re-throwing the exception:')
+                raise exception
+
+            return False
+
+    print(f'Self test OK. Time elapsed {perf_counter() - start_time:0.1f}s')
+
+    return True
 
 def convert_data_to_bf_in_memory(input_data, algo='segmented'):
     program = ''
@@ -277,13 +453,15 @@ def main():
     parser.add_argument('--mode', '-m', choices=['just-print', 'in-memory'], default='in-memory', help='Program type to generate')
     parser.add_argument('--preset', type=int, help=f'Use a preset string as input. Presets available: {len(input_presets)}')
     parser.add_argument('--no-program', action='store_true', help='Do not output resulting program, only debug messages')
+    parser.add_argument('--no-verify', action='store_true', help='Do not verify the generated program for correctness')
+    parser.add_argument('--run-test', nargs='?', const=250, default=None, type=int, help='Test algorithm on random inputs, optionally specify number of runs')
 
     args = parser.parse_args()
     verbose = args.verbose
     
     # get input list of values
-    input_methods = sum([args.text is not None, args.file is not None, args.preset is not None])
-    input_data = None
+    input_methods = sum([args.text is not None, args.file is not None, args.preset is not None, args.run_test is not None])
+    input_data = []
     if input_methods > 1:
         print('Error: several input methods are specified')
         exit(1)
@@ -307,17 +485,36 @@ def main():
             print(f'Error: failed to read file {args.file}: {e}')
             exit(1)
 
+    if 0 in input_data:
+        print(f'Error: Null bytes are not allowed in input data (at index {input_data.index(0)})')
+        exit(1)
+
     # generate one or more programs for given input
-    programs = []
+    generator = None
 
     if args.mode == 'in-memory':
         algos = args.algo if len(args.algo) > 0 else ['segmented']
-        programs = [(convert_data_to_bf_in_memory(input_data, algo), algo) for algo in algos]
+        generator = convert_data_to_bf_in_memory
     else:
         print(f'Unsupported mode: {args.mode}')
-    
-    # print the results
+        exit(1)
+
+    if args.run_test is not None:
+        for algo in algos:
+            if not run_self_test(generator, (algo, ), run_count=args.run_test):
+                exit(1)
+        exit(0)
+
+    programs = [(generator(input_data, algo), algo) for algo in algos]
+
+    # verify and print the results
     for program, algo in programs:
+        if not args.no_verify:
+            ok = verify_program(program, input_data)
+            if not ok:
+                print(f'Error: verification failed for program generated by algo {algo}')
+                exit(1)
+
         print_program(program, len(input_data), args.no_program, algo)
 
 if __name__ == "__main__":
