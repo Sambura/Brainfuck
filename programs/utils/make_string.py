@@ -128,13 +128,13 @@ def string_to_bf_segmented(text: list[int]):
         start_time = perf_counter()
 
     # precompute assets
-    optimal_factors = np.array([[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)]) # (126, text_size, 2)
+    optimal_factors = np.array([[get_optimal_factor(x, factor) for x in text] for factor in range(2, 128)], dtype=np.int_) # (126, text_size, 2)
     factor_range = optimal_factors.shape[0]
-    factor_sums = np.zeros((factor_range, text_size + 1), dtype=np.int64)
+    factor_sums = np.zeros((factor_range, text_size + 1), dtype=np.int_)
     factor_sums[:, 1:] = np.cumsum(optimal_factors[:, :, 0], axis=1)
-    remainder_sums = np.zeros((factor_range, text_size + 1), dtype=np.int64)
+    remainder_sums = np.zeros((factor_range, text_size + 1), dtype=np.int_)
     remainder_sums[:, 1:] = np.cumsum(np.abs(optimal_factors[:, :, 1]), axis=1)
-    tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda r: r == 0, x[i:, 1])) for i in range(len(x))] for x in optimal_factors])
+    tailing_zeros = np.array([[sum(1 for _ in takewhile(lambda r: r == 0, x[i:, 1])) for i in range(len(x))] for x in optimal_factors], dtype=np.int_)
     if text_size > 4:
         precomputed_escapes = np.zeros_like(tailing_zeros)
         precomputed_escape_starts = np.zeros_like(tailing_zeros)
