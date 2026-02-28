@@ -92,7 +92,6 @@ def verify_program(program: str, expected_output: list[int], return_details=Fals
         print('Encountered error during verification')
         return False
 
-    end_time = perf_counter()
     if verbose > 0:
         print(f'Verification took {1000 * (perf_counter() - start_time):0.1f}ms')
 
@@ -190,18 +189,17 @@ def string_to_bf_segmented(text: list[int]):
         print(f'Preprocessing took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
 
-    # segment_map[start_index][end_index] = segment
-    segment_map = [[None] * text_size for _ in range(text_size)]
-    for i, c in enumerate(base_conversion):
-        segment_map[i][i] = {'code': c, 'score': 0, 'start_index': i, 'size': 1}
-    segment_count = text_size
-
     def avg_score(segment):
         return segment['score'] / segment['size']
+    
+    sequences, seq_scores = [[]], [0]
 
     # try making segments for every character except for last (since it has no one to group with; segments only go left->right)
-    for index in range(text_size - 1):
-        for last_index in range(index + 1, text_size):
+    for last_index in range(text_size):
+        current_sequence = sequences[-1] + [{'code': base_conversion[last_index], 'score': 0, 'start_index': last_index, 'size': 1}]
+        current_seq_score = seq_scores[-1]
+
+        for index in range(last_index):
             segment_size = last_index - index + 1
             uncompressed_size = uncompressed_size_sums[last_index + 1] - uncompressed_size_sums[index]
 
@@ -246,8 +244,11 @@ def string_to_bf_segmented(text: list[int]):
                 if verbose > 3:
                     print(f'Adding a new segment (best_index: {best_index}): [{index};{last_index}] "{values_to_text(text[index:last_index + 1])}" ' +
                           f'(length: {segment_size}), score: {best_segment["score"]} (avg {avg_score(best_segment)})')
-                segment_map[index][last_index] = best_segment
-                segment_count += 1
+                    
+                new_score = seq_scores[index] + segment_score
+                if new_score >= current_seq_score:
+                    current_seq_score = new_score
+                    current_sequence = [*sequences[index], best_segment]
             else:
                 if verbose > 3:
                     print(f'Failed to make a good segment: [{index};{last_index}] (length: {segment_size}; score: {best_segment["score"]})')
@@ -255,39 +256,14 @@ def string_to_bf_segmented(text: list[int]):
                 if best_segment['score'] < 0:
                     break
 
-    if verbose > 0:
-        print(f'Built {segment_count} segments. Segment building took {perf_counter() - start_time:0.2f}s')
-        start_time = perf_counter()
+        sequences.append(current_sequence)
+        seq_scores.append(current_seq_score)
 
-    # now we need to arrange segments in the best way
-
-    def build_best_sequence_dp():
-        sequences, scores = [[]], [0]
-    
-        for target_index in range(text_size):
-            current_score = -1
-            current_sequence = None
-
-            # look for segment starting at base and ending at target_index that are better than what we have already
-            for base in range(target_index + 1):
-                matching_segment = segment_map[base][target_index]
-                if matching_segment is None: continue
-
-                # figure out resulting score with new segment
-                new_score = scores[base] + matching_segment['score']
-                if new_score >= current_score:
-                    current_score = new_score
-                    current_sequence = [*sequences[base], matching_segment]
-
-            sequences.append(current_sequence)
-            scores.append(current_score)
-
-        return sequences[-1]
-
-    best_sequence = build_best_sequence_dp()
+    best_sequence = sequences[-1]
 
     if verbose > 0:
-        print(f'Assembled {len(best_sequence)} segments in sequence (total score: {sum([x["score"] for x in best_sequence])})')
+        print(f'Built and assembled {len(best_sequence)} segments in sequence. (total score: {seq_scores[-1]}). ' +
+              f'Segment building and assembly took {perf_counter() - start_time:0.2f}s')
 
         if verbose > 1:
             for segment in best_sequence:
@@ -296,7 +272,6 @@ def string_to_bf_segmented(text: list[int]):
                 print(f'Segment: [{index};{last_index}] "{values_to_text(text[index:last_index + 1])}"; ' +
                       f'score: {segment["score"]} (avg {avg_score(segment):0.2f})')
 
-        print(f'Segment assembly took {perf_counter() - start_time:0.2f}s')
         start_time = perf_counter()
 
     program_segments = []
@@ -425,7 +400,7 @@ def print_program(program, input_len, no_program, name='default'):
     base_size = len(program)
 
     if not no_program:
-        print(f'Resulting program ({name}): \n\n{program}')
+        print(f'Resulting program (algo: {name}): \n\n{program}')
 
     print(f'\nBase program size: {base_size} instructions (avg: {base_size / input_len:0.2f} inst/char)')
 
