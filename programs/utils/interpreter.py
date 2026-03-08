@@ -22,6 +22,7 @@ def _bf_execute_basic(program: str, in_data: list[int], iter_limit:int=50000000)
             ptr += 1
         elif c == '<':
             ptr -= 1
+            assert ptr >= 0
         elif c == '.':
             stdout.append(memory[ptr])
         elif c == ',':
@@ -118,6 +119,7 @@ def _bf_execute_preprocessed(program: str, in_data: list[int], iter_limit:int=10
             memory[ptr] = (memory[ptr] + consts[pc]) & 0xFF
         elif opcode == 2: # SHIFT
             ptr += consts[pc]
+            assert ptr >= 0
         elif opcode == 4 and memory[ptr] != 0: # END_LOOP
             pc = consts[pc]
             loop_iters += 1
