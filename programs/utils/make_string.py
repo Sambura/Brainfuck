@@ -46,7 +46,7 @@ def signed_value_to_bf_mult(v: int, no_drift: bool=True) -> str:
             return f'>{"+" * f1}[-<{primary_inst * f2}>]<{primary_inst * rem}'
         else:
             return f'{"+" * f1}[->{primary_inst * f2}<]>{primary_inst * rem}'
-    
+
     if no_drift:
         return f'>{"+" * f1}[-<{primary_inst * (f2 + 1)}>]<{secondary_inst * rem2}'
     else:
@@ -159,7 +159,7 @@ def bf_active_shift_collapse(program: str) -> str:
                 if next_stop_index == movable_chunk[1]:
                     scan_start += 1
                     continue
-                
+
                 chunk = chunk[:movable_chunk[0]] + chunk[movable_chunk[1] + 1:next_stop_index + 1] + sub_chunk + chunk[next_stop_index + 1:]
 
                 continue
@@ -249,7 +249,7 @@ def string_to_bf_segmented(text: list[int], no_drift=True, silent=False):
         precomputed_escapes = np.zeros_like(tailing_zeros)
         precomputed_escape_starts = np.zeros_like(tailing_zeros)
         escape_ramp = np.arange(1, 4) - 5
-    
+
         for factor_index in range(common_factor_range_end - common_factor_range_start):
             l_factors = optimal_factors[factor_index, :, 0].tolist()
             pes = precomputed_escapes[factor_index]
@@ -385,7 +385,7 @@ def string_to_bf_segmented(text: list[int], no_drift=True, silent=False):
 
     def avg_score(segment):
         return segment['score'] / segment['size']
-    
+
     sequences, seq_scores = [[]], [0]
     mono_segment = None
 
@@ -440,7 +440,7 @@ def string_to_bf_segmented(text: list[int], no_drift=True, silent=False):
                 if verbose_local > 3:
                     print(f'Adding a new segment (best_index: {best_index}): [{index};{last_index}] "{values_to_text(text[index:last_index + 1])}" ' +
                           f'(length: {segment_size}), score: {best_segment["score"]} (avg {avg_score(best_segment)})')
-                    
+
                 new_score = seq_scores[index] + segment_score
                 if new_score >= current_seq_score:
                     current_seq_score = new_score
@@ -496,45 +496,67 @@ def bf_print_values_const(text: list[int]) -> str:
     deltas = np.array(text) - np.array([0] + text[:-1])
     return ''.join([f'{signed_value_to_bf(delta)}.' for delta in deltas])
 
-def bf_print_values_ranged(text: list[int], max_memory_cells=None, silent=False) -> str:
+def bf_print_values_ranged(text: list[int], max_memory_cells=257, max_optimal_ranges=7, avoid_loops=False, silent=False) -> str:
     fn_start_time = perf_counter()
     verbose_local = 0 if silent else verbose
-    if max_memory_cells is None: max_memory_cells = 256
     if max_memory_cells < 2:
         raise Exception('max_memory_cells should be greater than 1')
-    no_drift = max_memory_cells < 3
+    no_drift = max_memory_cells == 2
 
     def in_range(value: int, _range: tuple) -> bool:
         return value >= _range[0] and value < _range[1]
-    
+
     # no reason for separate logic for now i think?
     def compute_program_size(ranges: list[tuple]) -> int:
         return len(generate_code(ranges))
 
     def generate_code(ranges: list[tuple]) -> str:
-        buckets = [ # [[(index, char)], ...] (len(ranges) items)
-            [
-                (i, c) for i, c in enumerate(text) if in_range(c, r)
-            ] for r in ranges
-        ]
-        base_values = [b[0][1] if len(b) > 0 else 0 for b in buckets] # for now this is better, but replace with the line above later
+        ranges = ranges.copy()
+        n = len(ranges)
+
+        # somehow we sometimes get 1 of the ranges completely unused (usually first or last),
+        # and yet it produces a shorter program than n - 1 ranges attempt. Could try looking into that?
+        empty_flag = True
+        while empty_flag:
+            empty_flag = False
+            buckets = [ # [[(index, char)], ...] (len(ranges) items)
+                [
+                    (i, c) for i, c in enumerate(text) if in_range(c, r)
+                ] for r in ranges
+            ]
+
+            for i in range(len(buckets))[::-1]:
+                if len(buckets[i]) == 0:
+                    del ranges[i]
+                    n = len(ranges)
+                    empty_flag = True
+
+        base_values = [b[0][1] if len(b) > 0 else 0 for b in buckets]
         print_sequence = [(i, c, bi) for bi, bucket in enumerate(buckets) for i, c in bucket]
         print_sequence = sorted(print_sequence, key=lambda x: x[0])
 
         # init base values
         program = string_to_bf_segmented(base_values, no_drift=no_drift, silent=True)
-        range_index = len(ranges) - 1
-
+        range_index = n - 1
+    
         for _, value, bucket_index in print_sequence:
             shift_delta = bucket_index - range_index
+            alt_delta = 4 + min(bucket_index, n - bucket_index - 1)
+
+            # TODO account for this during range selection (esp. range ordering)
+            if alt_delta < abs(shift_delta) and not avoid_loops:
+                program += f'[{"<" if shift_delta < 0 else ">"}]' + ('>' if shift_delta < 0 else '<') * (alt_delta - 3)
+            else:
+                program += ('<' if shift_delta < 0 else '>') * abs(shift_delta)
+
             range_index = bucket_index
-            program += ('<' if shift_delta < 0 else '>') * abs(shift_delta)
             value_delta = value - base_values[bucket_index]
             program += signed_value_to_bf(value_delta)
             base_values[bucket_index] = value
             program += '.'
-        
-        return bf_compress(program)
+
+        c_program = bf_compress(program)
+        return c_program
 
     text_np = np.array(text, dtype=np.int_)
 
@@ -543,65 +565,99 @@ def bf_print_values_ranged(text: list[int], max_memory_cells=None, silent=False)
         mx = np.max(text_np) + 1
         endpoints = np.linspace(mn, mx, range_count + 1).astype(np.int_).tolist()
         return [(x, y) for x, y in zip(endpoints[:-1], endpoints[1:])]
-    
-    def optimize_ranges_naive(ranges: list[tuple]) -> list[tuple]:
-        def evaluate_ranges(ranges):
-            range2chars = [np.array([c for c in text if in_range(c, rng)], dtype=np.int_) for rng in ranges]
-            deltas = [chars[1:] - chars[:-1] for chars in range2chars]
-            total_deltas = [np.sum(np.abs(x)) for x in deltas]
 
-            return sum(total_deltas)
-        
+    def optimize_ranges_naive(ranges: list[tuple]) -> list[tuple]:
+        def evaluate_ranges(text_local, ranges):
+            range2chars = [text_local[(text_local >= rng[0]) & (text_local < rng[1])] for rng in ranges]
+            total_deltas = sum(np.sum(np.abs(chars[1:] - chars[:-1])) for chars in range2chars)
+
+            return total_deltas
+
         best_ranges = ranges
-        best_deltas = evaluate_ranges(best_ranges)
 
         for bi in range(len(ranges) - 1):
-            base_ranges = best_ranges[:]
+            test_ranges = best_ranges[:]
+            text_np_local = text_np[(text_np >= test_ranges[bi][0]) & (text_np < test_ranges[bi + 1][1])]
+            deltas_local = evaluate_ranges(text_np_local, test_ranges[bi:bi+2])
+            base_value = test_ranges[bi][1]
 
-            for dir in [-1, 1]:
-                base = base_ranges[bi][0] if dir == -1 else base_ranges[bi + 1][1] - 1
-                b_value = base_ranges[bi][1]
-                dir_ranges = base_ranges[:]
+            for dir, limit in [(-1, test_ranges[bi][0] + 1), (1, test_ranges[bi + 1][1] - 1)]:
+                b_value = base_value
 
-                while b_value != base:
+                while b_value != limit:
                     b_value += dir
-                    dir_ranges[bi] = (dir_ranges[bi][0], b_value)
-                    dir_ranges[bi + 1] = (b_value, dir_ranges[bi + 1][1])
+                    test_ranges[bi] = (test_ranges[bi][0], b_value)
+                    test_ranges[bi + 1] = (b_value, test_ranges[bi + 1][1])
 
-                    new_deltas = evaluate_ranges(dir_ranges)
-                    if new_deltas < best_deltas:
-                        best_deltas = new_deltas
-                        best_ranges = dir_ranges[:]
+                    new_deltas = evaluate_ranges(text_np_local, test_ranges[bi:bi+2])
+                    if new_deltas < deltas_local:
+                        deltas_local = new_deltas
+                        best_ranges = test_ranges[:]
 
         return best_ranges
-    
+
     def order_ranges(ranges: list[tuple]) -> list[tuple]:
         n = len(ranges)
-        char_order = [[i for i, x in enumerate(ranges) if in_range(c, x)][0] for c in text] # char_order[i] is the index of range for character i
+        char_order = np.zeros_like(text_np)
+        for i, rng in enumerate(ranges[1:], start=1): # technically we don't need to evaluate one of the ranges, let's go with the first one
+            char_order[(text_np >= rng[0]) & (text_np < rng[1])] = i
 
-        assert len(char_order) == len(text)
-        transition_matrix = np.zeros((n, n), dtype=np.int_) # TM[x, y] is transition count between range x and range y (both directions)
-        for x in range(n):
-            for y in range(x + 1, n):
-                transition_matrix[x, y] = sum([1 for i in range(0, len(text) - 1) if set(char_order[i:i + 2]) == set([x, y])])
-        
+        transition_matrix = np.zeros((n, n), dtype=np.int_).tolist() # TM[x, y] is transition count between range x and range y (both directions)
+        for x, y in zip(char_order[:-1], char_order[1:]):
+            if x == y:
+                continue
 
-        transition_matrix = transition_matrix.tolist()
+            x, y = min(x, y), max(x, y)
+            transition_matrix[x][y] += 1
+
         order_map = [] # (order, transition_cost)
 
-        # pretty sure this is n!. TODO implement heuristic based approach for n > 10
+        def get_transition_cost(order: list[int]):
+            order_map = [0] * n
+            for i, v in enumerate(order):
+                order_map[v] = i
+            return sum([transition_matrix[x][y] * abs(order_map[x] - order_map[y]) for x in range(n) for y in range(x + 1, n)])
+
         def compute_order(order: list[int], remaining_options: list[int]):
             if len(remaining_options) == 0:
-                order_cost = sum([transition_matrix[x][y] * abs(order.index(x) - order.index(y)) for x in range(n) for y in range(x + 1, n)])
+                order_cost = get_transition_cost(order)
                 order_map.append((order, order_cost))
                 return
-            
+
             for opt in remaining_options:
                 l_opts = remaining_options[:]
                 l_opts.remove(opt)
                 compute_order([*order, opt], l_opts)
 
-        compute_order([], list(range(n)))
+        def estimate_order():
+            def get_partial_cost(order: list[int]):
+                order_map = [0] * n
+                for i, v in enumerate(order):
+                    order_map[v] = i
+                return sum([transition_matrix[x][y] * abs(order_map[x] - order_map[y]) for i, x in enumerate(order) for y in order[i + 1:]])
+
+            # [(x, y, c), ...] : c transitions between x and y
+            transition_list = [(x, y, transition_matrix[x][y]) for x in range(n) for y in range(x + 1, n)]
+            transition_list = sorted(transition_list, key=lambda x: x[2], reverse=True) # highest t-counts are first
+            h_order = [*transition_list.pop(0)[0:2]]
+            while len(h_order) < n:
+                connected_index = next(i for i, t in enumerate(transition_list) if t[0] in h_order or t[1] in h_order)
+                x, y, count = transition_list.pop(connected_index)
+                missing_range = x if y in h_order else y
+                if missing_range in h_order:
+                    continue # there are more transitions than ranges
+
+                pre_order = [missing_range, *h_order]
+                post_order = [*h_order, missing_range]
+                h_order = pre_order if get_partial_cost(pre_order) < get_partial_cost(post_order) else post_order
+
+            order_map.append((h_order, get_transition_cost(h_order)))
+            order_map.append((h_order[::-1], get_transition_cost(h_order[::-1])))
+
+        if n <= max_optimal_ranges:
+            compute_order([], list(range(n)))
+        else:
+            estimate_order()
 
         order_map = sorted(order_map, key=lambda x: x[1])
         best_orders = [x for x in order_map if x[1] == order_map[0][1]]
@@ -614,14 +670,22 @@ def bf_print_values_ranged(text: list[int], max_memory_cells=None, silent=False)
     failed_ranges = 0
 
     # limit range count to 9 due to O(n!) algo in order_ranges (where n is number of ranges)
-    max_range_count = min(max_memory_cells - 2, 9) # 1 memory cell for init factor, 1 for init drift
+    max_range_count = min(max_memory_cells - 2, 256) # 1 memory cell for init factor, 1 for init drift
+    if verbose_local > 0:
+        print(f'Initialization took {1000 * (perf_counter() - fn_start_time):0.2f}ms. Max range count: {max_range_count}/255')
+
     for range_count in range(2, max_range_count + 1):
+        start_time = perf_counter()
         new_ranges = generate_ranges_naive(range_count)
         new_ranges = optimize_ranges_naive(new_ranges)
         best_range_orders = order_ranges(new_ranges)
-        
+
         programs = [(compute_program_size(x), x) for x in best_range_orders]
         new_size, new_best_ranges = sorted(programs, key=lambda x: x[0])[0]
+
+        if verbose_local > 1:
+            print(f'Attempted {range_count} ranges, best program size: {new_size}. Time elapsed: {1000 * (perf_counter() - start_time):0.2f}ms')
+            start_time = perf_counter()
 
         if new_size < best_size:
             best_size = new_size
@@ -631,6 +695,9 @@ def bf_print_values_ranged(text: list[int], max_memory_cells=None, silent=False)
             failed_ranges += 1
         else:
             break
+
+    if verbose_local > 0:
+        print(f'Finished trying ranges, best range count: {len(best_ranges)}')
 
     code_final = generate_code(best_ranges)
     if verbose_local > 0:
@@ -643,10 +710,14 @@ def run_self_test(program_generator, args, run_count=250) -> bool:
 
     start_time = perf_counter()
     exception = None
+    total_size = 0
+    total_encoded_size = 0
     for _ in range(run_count):
         test_input = generate_test_input()
+        total_size += len(test_input)
         try:
             test_program = program_generator(test_input, *args)
+            total_encoded_size += len(test_program)
             ok, test_output = verify_program(test_program, test_input, return_details=True)
         except Exception as e:
             ok = False
@@ -669,6 +740,7 @@ def run_self_test(program_generator, args, run_count=250) -> bool:
             return False
 
     print(f'Self test OK. Time elapsed {perf_counter() - start_time:0.1f}s')
+    print(f'Total input length: {total_size}, total program size: {total_encoded_size}, avg: {total_encoded_size / total_size:0.2f} inst/char')
 
     return True
 
@@ -729,10 +801,16 @@ def main():
     parser.add_argument('--no-verify', action='store_true', help='Do not verify the generated program for correctness')
     parser.add_argument('--run-test', nargs='?', const=250, default=None, type=int, help='Test algorithm on random inputs, optionally specify number of runs')
     parser.add_argument('--allow-incorrect', action='store_true', help='Print program even if it did not pass verification')
+    parser.add_argument('--random-seed', '-s', type=int, default=None, help='Seed to initialize random number generator, e.g. for reproducible test runs')
 
     args = parser.parse_args()
     verbose = args.verbose
-    
+
+    if args.random_seed is not None:
+        print(f'Using custom seed: {args.random_seed}')
+        random.seed(args.random_seed)
+        np.random.seed(args.random_seed)
+
     # get input list of values
     input_methods = sum([args.text is not None, args.file is not None, args.preset is not None, args.run_test is not None])
     input_data = []
