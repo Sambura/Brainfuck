@@ -4,6 +4,7 @@ from time import perf_counter
 import argparse
 import numpy as np
 import random
+import inspect
 
 from interpreter import bf_execute
 
@@ -223,7 +224,7 @@ def generate_test_input():
 
     return it2.astype(int).tolist()
 
-def string_to_bf_segmented(text: list[int], no_drift=True, silent=False):
+def string_to_bf_segmented(text: list[int], no_drift: bool=True, silent: bool=False):
     fn_start_time = perf_counter()
     verbose_local = 0 if silent else verbose
 
@@ -496,7 +497,7 @@ def bf_print_values_const(text: list[int]) -> str:
     deltas = np.array(text) - np.array([0] + text[:-1])
     return ''.join([f'{signed_value_to_bf(delta)}.' for delta in deltas])
 
-def bf_print_values_ranged(text: list[int], max_memory_cells=257, max_optimal_ranges=7, avoid_loops=False, silent=False) -> str:
+def bf_print_values_ranged(text: list[int], max_memory_cells: int=257, max_optimal_ranges: int=7, avoid_loops: bool=False, silent: bool=False) -> str:
     fn_start_time = perf_counter()
     verbose_local = 0 if silent else verbose
     if max_memory_cells < 2:
@@ -705,8 +706,8 @@ def bf_print_values_ranged(text: list[int], max_memory_cells=257, max_optimal_ra
 
     return code_final
 
-def run_self_test(program_generator, args, run_count=250) -> bool:
-    print(f'Executing self test: {run_count} runs with args: {args}')
+def run_self_test(mode: str, algo: str, run_count=250, str_kwargs={}) -> bool:
+    print(f'Executing self test: {run_count} runs with args: {mode}, {algo}, {str_kwargs}')
 
     start_time = perf_counter()
     exception = None
@@ -716,7 +717,7 @@ def run_self_test(program_generator, args, run_count=250) -> bool:
         test_input = generate_test_input()
         total_size += len(test_input)
         try:
-            test_program = program_generator(test_input, *args)
+            test_program = bf_encode(test_input, mode, algo, str_kwargs)
             total_encoded_size += len(test_program)
             ok, test_output = verify_program(test_program, test_input, return_details=True)
         except Exception as e:
@@ -744,27 +745,61 @@ def run_self_test(program_generator, args, run_count=250) -> bool:
 
     return True
 
-def convert_data_to_bf_in_memory(input_data, algo='segmented'):
-    program = ''
+def make_compatible_kwargs(func, str_kwargs: dict[str, str]):
+    sig = inspect.signature(func)
+    converted = {}
 
-    if algo == 'segmented':
-        program = string_to_bf_segmented(input_data)
-    elif algo == 'perchar':
-        program = values_to_bf_perchar(input_data, value_to_bf_optimal)
-    elif algo == 'basic':
-        program = values_to_bf_perchar(input_data, value_to_bf_const)
-    else:
-        raise Exception(f'Unknown algo: {algo}')
+    for name, param in sig.parameters.items():
+        if name not in str_kwargs:
+            continue
 
-    return program + '[<]>[.>]'
+        value = str_kwargs[name]
+        ann = param.annotation
 
-def print_data_bf_inplace(input_data, algo='ranged'):
-    if algo == 'basic':
-        return bf_print_values_const(input_data)
-    if algo == 'ranged':
-        return bf_print_values_ranged(input_data)
-    else:
-        raise Exception(f'Unknown algo: {algo}')
+        if ann is inspect._empty:
+            converted[name] = value
+        elif ann is bool: # special case
+            converted[name] = value.lower() in ("1", "true", "yes")
+        else:
+            converted[name] = ann(value)
+
+    for name in str_kwargs:
+        if name not in converted:
+            print(f'WARNING: unrecognized parameter `{name}`')
+
+    return converted
+
+def invoke_with_kwargs(func, *args, str_kwargs):
+    return func(*args, **make_compatible_kwargs(func, str_kwargs))
+
+in_memory_bf_encoders = {
+    'segmented': lambda x, str_kwargs: invoke_with_kwargs(string_to_bf_segmented, x, str_kwargs=str_kwargs) + '[<]>[.>]',
+    'perchar': lambda x, str_kwargs: invoke_with_kwargs(values_to_bf_perchar, x, value_to_bf_optimal, str_kwargs=str_kwargs) + '[<]>[.>]',
+    'basic': lambda x, str_kwargs: invoke_with_kwargs(values_to_bf_perchar, x, value_to_bf_const, str_kwargs=str_kwargs) + '[<]>[.>]',
+}
+"Maps algo name to encoder callables (for in-memory mode)"
+
+in_place_bf_encoders = {
+    'ranged': lambda x, str_kwargs: invoke_with_kwargs(bf_print_values_ranged, x, str_kwargs=str_kwargs),
+    'basic': lambda x, str_kwargs: invoke_with_kwargs(bf_print_values_const, x, str_kwargs=str_kwargs),
+}
+"Maps algo name to encoder callables (for in-place mode)"
+
+bf_encoders_map = {
+    'in-memory': in_memory_bf_encoders,
+    'in-place': in_place_bf_encoders,
+}
+"Maps encoder mode to the dict of encoders. Encoders accept input data as a first argument, and any number of kwargs"
+
+def bf_encode(input_data, mode, algo, str_kwargs):
+    if mode not in bf_encoders_map:
+        raise Exception(f'Unknown mode: `{mode}`')
+    if algo not in bf_encoders_map[mode]:
+        raise Exception(f'Unknown algo: `{algo}` for mode `{mode}`')
+
+    encoder = bf_encoders_map[mode][algo]
+    program = encoder(input_data, str_kwargs)
+    return bf_compress(program)
 
 def print_program(program, input_len, no_program, name='default'):
     base_size = len(program)
@@ -789,29 +824,44 @@ def main():
         'VeRy RaNdOm 0912846510 {are you here, listening???}',
     ]
 
+    encoder_mode_names = list(bf_encoders_map.keys())
+    encoder_algo_names = list(set([y for x in bf_encoders_map.values() for y in x]))
+
+    # Parse CLI arguments
     parser = argparse.ArgumentParser(description="Convert text to a brainfuck program")
 
     parser.add_argument('text', nargs='?', default=None, help='Text to convert')
     parser.add_argument('--file', '-f', type=str, help='Take input from a file instead')
     parser.add_argument('--verbose', '-v', action='count', default=0, help='Enable verbose output. Repeat to increase verbosity level')
-    parser.add_argument('--algo', '-a', choices=['segmented', 'perchar', 'basic', 'ranged'], default=[], action='append', help='Conversion algorithm (multiple allowed)')
-    parser.add_argument('--mode', '-m', choices=['just-print', 'in-memory'], default='in-memory', help='Program type to generate')
+    parser.add_argument('--algo', '-a', choices=encoder_algo_names, default=[], action='append', help='Conversion algorithm (multiple allowed)')
+    parser.add_argument('--mode', '-m', choices=encoder_mode_names, default='in-place', help='Program type to generate')
     parser.add_argument('--preset', type=int, help=f'Use a preset string as input. Presets available: {len(input_presets)}')
     parser.add_argument('--no-program', action='store_true', help='Do not output resulting program, only debug messages')
     parser.add_argument('--no-verify', action='store_true', help='Do not verify the generated program for correctness')
     parser.add_argument('--run-test', nargs='?', const=250, default=None, type=int, help='Test algorithm on random inputs, optionally specify number of runs')
     parser.add_argument('--allow-incorrect', action='store_true', help='Print program even if it did not pass verification')
     parser.add_argument('--random-seed', '-s', type=int, default=None, help='Seed to initialize random number generator, e.g. for reproducible test runs')
+    parser.add_argument('--param', '-p', type=str, default=[], action='append', help='Pass algo-specific parameters with `-p arg=value`. Can be specified multiple times')
 
     args = parser.parse_args()
-    verbose = args.verbose
+    verbose = args.verbose # set global verbose level
 
+    # Select a default algo if no --algo options were specified, otherwise just take specified algos
+    algos = args.algo if len(args.algo) > 0 else [next(iter(bf_encoders_map[args.mode].keys()))]
+    algo_params = [p.split('=') for p in args.param]
+    for i, p in enumerate(algo_params):
+        if len(p) != 2:
+            print(f'Invalid parameter: {args.param[i]}')
+            exit(1)
+    algo_params = {k: v for k, v in algo_params}
+
+    # Seed RNG
     if args.random_seed is not None:
         print(f'Using custom seed: {args.random_seed}')
         random.seed(args.random_seed)
         np.random.seed(args.random_seed)
 
-    # get input list of values
+    # Get input list of values into `input_data` / or run self test if requested
     input_methods = sum([args.text is not None, args.file is not None, args.preset is not None, args.run_test is not None])
     input_data = []
     if input_methods > 1:
@@ -836,44 +886,28 @@ def main():
         except Exception as e:
             print(f'Error: failed to read file {args.file}: {e}')
             exit(1)
+    elif args.run_test is not None: # Run test here, if requested
+        for algo in algos:
+            if not run_self_test(args.mode, algo, run_count=args.run_test, str_kwargs=algo_params):
+                exit(1)
+        exit(0)
 
+    # Verify there are no null bytes in input data
     if 0 in input_data:
         print(f'Error: Null bytes are not allowed in input data (at index {input_data.index(0)})')
         exit(1)
 
-    # generate one or more programs for given input
-    generator = None
-
-    if args.mode == 'in-memory':
-        algos = args.algo if len(args.algo) > 0 else ['segmented']
-        generator = convert_data_to_bf_in_memory
-    elif args.mode == 'just-print':
-        algos = args.algo if len(args.algo) > 0 else ['ranged']
-        generator = print_data_bf_inplace
-    else:
-        print(f'Unsupported mode: {args.mode}')
-        exit(1)
-
-    if args.run_test is not None:
-        for algo in algos:
-            if not run_self_test(generator, (algo, ), run_count=args.run_test):
-                exit(1)
-        exit(0)
-
-    programs = [(generator(input_data, algo), algo) for algo in algos]
+    # encode one or more programs, one for each selected algo
+    programs = [(bf_encode(input_data, args.mode, algo, algo_params), algo) for algo in algos]
 
     # verify and print the results
     for program, algo in programs:
-        program = bf_compress(program)
         if not args.no_verify:
             ok = verify_program(program, input_data)
             if not ok:
                 print(f'Error: verification failed for program generated by algo {algo}')
                 if not args.allow_incorrect:
                     exit(1)
-
-        # with open('.last_program', 'wt') as tmp_out:
-        #     tmp_out.write(program)
 
         print_program(program, len(input_data), args.no_program, algo)
 
