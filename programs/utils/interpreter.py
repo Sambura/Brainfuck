@@ -1,5 +1,6 @@
 from time import perf_counter
 from collections.abc import Iterable, Callable
+from typing import Any
 from itertools import takewhile
 
 def format_elapsed_time(seconds):
@@ -65,7 +66,7 @@ def _bf_execute_basic(program: str, input_generator: Iterable[int], output_consu
         pc += 1
 
 def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], output_consumer: Callable[[int], None],
-                             iter_limit: int=None, control_char=None, **kwargs) -> None:
+                             iter_limit: int=None, control_char=None, optimization_level=2, **kwargs) -> None:
     """ Execute brainfuck program.
         Processes program into list of opcodes before executing.
         Also combines consecutive +/- and </> instructions          """
@@ -73,10 +74,15 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
     if len(kwargs) > 0:
         print(f'Warning: ignoring unknown kwargs {kwargs}')
 
+    # OPCODES:
+    #   * Base opcodes: 0 - NOOP, 1 - ADD, 2 - SHIFT, 3 - BEGIN_LOOP, 4 - END_LOOP, 5 - PRINT, 6 - GET
+    #   * Control opcode: 7 - CONTROL (custom command)
+    #   * Optimization opcodes: 8 - LOAD IMMEDIATE, 9 - MULTI SUM, 10 - INVERT, 11 - GLIDE, 12 - OFFSET ADD
+
     def preprocess(program: str):
-        opcodes = [0] # 0 - NOOP, 1 - ADD, 2 - SHIFT, 3 - BEGIN_LOOP, 4 - END_LOOP, 5 - PRINT, 6 - GET, 7 - CONTROL (custom command)
+        opcodes = [0]
         consts = [0]
-        control_dict = {0: {}, 1: {}}
+        control_dict = {}
         loop_stack = []
         skip_flag = False
 
@@ -87,14 +93,14 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
 
             if c == '+' or c == '-':
                 value = 1 if c == '+' else -1
-                if opcodes[-1] == 1:
+                if opcodes[-1] == 1 and optimization_level > 0:
                     consts[-1] += value
                 else:
                     opcodes.append(1)
                     consts.append(value)
             elif c == '<' or c == '>':
                 value = 1 if c == '>' else -1
-                if opcodes[-1] == 2:
+                if opcodes[-1] == 2 and optimization_level > 0:
                     consts[-1] += value
                 else:
                     opcodes.append(2)
@@ -123,18 +129,15 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
 
                 def get_message(start_index):
                     message_indices = list(takewhile(lambda x: program[x] not in '+-[],.<>\n\r$', range(start_index, len(program))))
-                    message_end = message_indices[-1] if len(message_indices) > 0 else start_index
+                    message_end = message_indices[-1] if len(message_indices) > 0 else start_index - 1
                     return program[start_index:message_end + 1]
 
                 if subcommand == '%': # measure time
                     skip_flag = subcommand == control_char
-                    message = get_message(i + 2)
-                    prev_record = control_dict[1].get(message, ([], None)) # ([opcode indices], last-measurement)
-                    prev_record[0].append(len(opcodes) - 1)
-                    control_dict[1][message] = prev_record
+                    control_dict[len(opcodes) - 1] = get_message(i + 2)
                     consts.append(1)
                 else:
-                    control_dict[0][len(opcodes) - 1] = get_message(i + 1)
+                    control_dict[len(opcodes) - 1] = get_message(i + 1)
                     consts.append(0)
 
                 opcodes.append(7)
@@ -144,11 +147,178 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
 
         return opcodes[1:], consts[1:], control_dict
 
+    # TODO: implement the thing that will prevent optimization if it will consume control opcode
+    def optimize(opcodes: list[int], consts: list[int], control_dict: dict[int, dict]):
+        ##### Step 1: decouple logic from control #####
+        program_logic = [] # (begin_id, end_id, opcode, optim_const, [TODO: has_bound_control])
+        program_control = [] # (id, control_opcode)
+        pre_ids = list(range(len(opcodes)))
+        __last_id = len(opcodes) - 1
+        __verbose = False #or True
+
+        def alloc_id():
+            nonlocal __last_id
+            __last_id += 1
+            return __last_id
+
+        for id, opcode, const in zip(pre_ids, opcodes, consts):
+            if opcode == 7:
+                program_control.append((id, const))
+                continue
+
+            program_logic.append((id, id, opcode, const))
+
+        ##### Step 2: optimize logic #####
+        def detect_load_immediate(index: int, succeeding: int) -> tuple[int, int, int]: # (start inclusive, end inclusive, const)
+            if succeeding < 2 or program_logic[index + 1][2] != 1 or program_logic[index + 2][2] != 4 or program_logic[index + 1][3] % 2 == 0:
+                return
+
+            if __verbose: print(f'Detected LI at {index}')
+            return index, index + 2, 0
+
+        def absorb_load_immediate(index: int, succeeding: int) -> tuple[int, int, int]:
+            start_index = index - 1 if index > 0 and program_logic[index - 1][2] == 1 else index # adds leading to LI are useless, remove
+            have_si = succeeding > 0 and program_logic[index + 1][2] == 1
+            succeeding_increment = program_logic[index + 1][3] if have_si else 0
+
+            if start_index != index or have_si:
+                if __verbose: print(f'Detected LIA at {index}')
+                return start_index, index + 1 if have_si else index, program_logic[index][3] + succeeding_increment
+
+        def detect_multi_sum(index: int, succeeding: int) -> tuple[int, int, Any]: # triggered on begin loop
+            # minimal multi sum: [->+<] (6 instructions) (this is actually an example of mono sum)
+            loop_code = program_logic[index + 1:list(takewhile(lambda x: program_logic[x][2] != 4, range(index + 1, len(program_logic))))[-1] + 1]
+
+            if len(loop_code) < 4 or len([x for x in loop_code if x[2] != 1 and x[2] != 2]) > 0: # drop if loop has anything other than add or shift
+                return
+
+            increment_profile = {} # { offset: increment_amount, ...]
+            offset = 0
+            for _, _, opcode, const in loop_code:
+                if opcode == 1: # ADD
+                    current_increment = increment_profile.get(offset, 0)
+                    increment_profile[offset] = current_increment + const
+                elif opcode == 2: # SHIFT
+                    offset += const
+                else:
+                    assert False
+
+            if 0 not in increment_profile or abs(increment_profile[0]) != 1:
+                return # if offset 0 is incremented by something other than 1 or -1 we cannot guarantee that the loop terminates, figure out how to do it later
+            do_invert = increment_profile.pop(0) == 1 # if we increment current value instead of decrementing, just invert the value before looping
+            offsets = sorted(list(increment_profile.items()), key=lambda x: x[0])
+            assert len(offsets) > 0
+            new_instructions = [(10, 0), (9, offsets)] if do_invert else [(9, offsets)]
+            if __verbose: print(f'Detected MS#{len(offsets)} at {index}')
+
+            return index, index + len(loop_code) + 1, new_instructions
+
+        def detect_glider(index: int, succeeding: int) -> tuple[int, int, int]:
+            if succeeding < 2 or program_logic[index + 1][2] != 2 or program_logic[index + 2][2] != 4:
+                return
+
+            if __verbose: print(f'Detected GL at {index}')
+            return index, index + 2, program_logic[index + 1][3]
+
+        def detect_offset_add(index: int, succeeding: int) -> tuple[int, int, Any]:
+            if succeeding < 2 or program_logic[index + 1][2] != 1 or program_logic[index + 2][2] != 2 or program_logic[index][3] != -program_logic[index + 2][3]:
+                return
+
+            if __verbose: print(f'Detected OADD at {index}')
+            return index, index + 2, (program_logic[index][3], program_logic[index + 1][3])
+
+        optimizers = [
+            # (trigger_opcode, detector -> const, new_opcode)
+            (3, detect_load_immediate, 8),
+            (8, absorb_load_immediate, 8),
+            (3, detect_multi_sum, None),
+            (3, detect_glider, 11),
+            (2, detect_offset_add, 12), # if optimizers are run one by one, this one should be run after multi sum one
+        ]
+
+        reiterate_flag = True
+        while reiterate_flag:
+            reiterate_flag = False
+            o_start, o_end, new_instructions = None, None, []
+
+            for i, (_, _, opcode, _) in enumerate(program_logic):
+                for trigger_opcode, optimizer, new_opcode in optimizers:
+                    if trigger_opcode != opcode:
+                        continue
+
+                    result = optimizer(i, len(program_logic) - i - 1)
+                    if result is None:
+                        continue
+
+                    o_start, o_end, new_instructions = result
+                    if new_opcode is not None: # treat new_instructions as a const value for this opcode
+                        new_instructions = [(new_opcode, new_instructions)]
+
+                    break
+
+                if len(new_instructions) > 0:
+                    reiterate_flag = True
+                    source_slice = program_logic[o_start:o_end + 1]
+                    begin_id, end_id = source_slice[0][0], source_slice[-1][1]
+                    id_sequence = [begin_id] + [alloc_id() for _ in range(len(new_instructions) - 1)] + [end_id]
+                    new_logic = []
+
+                    for i, (opcode, const) in enumerate(new_instructions):
+                        new_logic.append((id_sequence[i], id_sequence[i + 1], opcode, const))
+
+                    program_logic = program_logic[:o_start] + new_logic + program_logic[o_end + 1:]
+
+                    break
+
+        ##### Step 3: inject controls back into program logic #####
+        for id, control_opcode in program_control:
+            control_unit = (id, id, 7, control_opcode)
+            control_index = 0
+
+            if id != 0:
+                target_units = [i for i, x in enumerate(program_logic) if x[1] == id - 1]
+                if len(target_units) == 0:
+                    print(f'Warning: could not re-inject control #{id}. This control opcode will be ignored. Use -O0 or -O1 to fix')
+                    continue
+
+                control_index = target_units[0] + 1
+
+            program_logic.insert(control_index, control_unit)
+
+        ##### Step 4: convert to interpreter format #####
+        new_opcodes = []
+        new_consts = []
+        def id2opcode(id):
+            return next((i for i, x in enumerate(program_logic) if x[0] == id), None)
+
+        for id1, id2, opcode, const in program_logic:
+            new_opcodes.append(opcode)
+            if opcode == 3 or opcode == 4: # loop opcodes
+                # current const: logic unit's ID. need to convert that into opcode index
+                const = id2opcode(const)
+
+            new_consts.append(const)
+
+        ##### Step 5: rebuild control dict #####
+        new_control_dict = {}
+        for id, value in control_dict.items():
+            opcode = id2opcode(id)
+
+            if opcode is not None: # true except if control was not re-injected
+                new_control_dict[opcode] = value
+
+        return new_opcodes, new_consts, new_control_dict
+
     opcodes, consts, control_dict = preprocess(program)
+
+    if optimization_level > 1:
+        opcodes, consts, control_dict = optimize(opcodes, consts, control_dict)
+
     memory = [0] * 32768
     pc = 0
     ptr = 0
     loop_iters = 0
+    ctl_timestamps = {}
     if iter_limit is None: iter_limit = 100000000
 
     while pc < len(opcodes):
@@ -171,9 +341,37 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
             output_consumer(memory[ptr])
         elif opcode == 6:   # GET
             memory[ptr] = next(input_generator) & 0xFF
+        elif opcode == 8:   # LOAD IMMEDIATE
+            memory[ptr] = consts[pc] & 0xFF
+        elif opcode == 9:   # MULTI SUM
+            offsets = consts[pc]    # offsets should be sorted (ascending)
+            value = memory[ptr]
+            if ptr + offsets[0][0] < 0:
+                raise Exception('Memory underflow')
+            memory[ptr] = 0         # current ptr is zeroed out by default. Offset 0 will cancel this out, if present
+            for offset, factor in offsets:
+                c_ptr = ptr + offset
+                memory[c_ptr] = (memory[c_ptr] + value * factor) & 0xFF
+        elif opcode == 12:  # OFFSET SUM
+            offset, increment = consts[pc]
+            c_ptr = ptr + offset
+            if c_ptr < 0:
+                raise Exception('Memory underflow')
+            memory[c_ptr] = (memory[c_ptr] + increment) & 0xFF
+        elif opcode == 11:  # GLIDER
+            step = consts[pc]
+            while memory[ptr] != 0:
+                ptr += step
+                if ptr < 0:
+                    raise Exception('Memory underflow')
+        elif opcode == 10:  # INVERT
+            c_ptr = ptr + consts[pc]
+            if c_ptr < 0:
+                raise Exception('Memory underflow')
+            memory[c_ptr] = (256 - memory[c_ptr]) & 0xFF
         elif opcode == 7:   # CONTROL
             if consts[pc] == 0: # CONTROL:0 state dump
-                print(f'\n[STATE DUMP]: {control_dict[0][pc]}. Program counter: {pc}, memory pointer: {ptr}. Memory:\n')
+                print(f'\n[STATE DUMP]: {control_dict[pc]}. Program counter: {pc}, memory pointer: {ptr}. Memory:\n')
                 last_nonzero_index = [i for i, m in enumerate(memory) if m != 0][-1]
                 slice_start = 0
                 slice_width = 20
@@ -185,13 +383,11 @@ def _bf_execute_preprocessed(program: str, input_generator: Iterable[int], outpu
                     print(f'[{current_start:5}:{slice_start - 1:5}]: {string_slice}')
             elif consts[pc] == 1: # CONTROL:1 measure time
                 timestamp = perf_counter()
-                for message, record in control_dict[1].items():
-                    if pc in record[0]:
-                        last_timestamp = record[1]
-                        if last_timestamp is not None:
-                            print(f'\n[TIME MEASURE]: {message}: {format_elapsed_time(timestamp - last_timestamp)} elapsed\n')
-                        control_dict[1][message] = (record[0], perf_counter())
-                        break
+                ts_name = control_dict[pc]
+                last_timestamp = ctl_timestamps.get(ts_name, None)
+                if last_timestamp is not None:
+                    print(f'\n[TIME MEASURE]: {ts_name}: {format_elapsed_time(timestamp - last_timestamp)} elapsed\n')
+                ctl_timestamps[ts_name] = perf_counter()
 
         pc += 1
 
@@ -261,6 +457,8 @@ def main():
     parser.add_argument('--implementation', type=str, default='best', choices=['best', 'basic', 'preprocessed'], help='Interpreter implementation name to use')
     parser.add_argument('--iter-limit', '-l', type=int, default=-1, help='Limit iteration count performed by interpreter (only "]" instruction counts as iteration)')
     parser.add_argument('--control-char', '-c', type=str, nargs='?', const='$', default=None, help='Character to use for debug interpreter commands like state dumping or time measurement')
+    parser.add_argument('-O', type=int, default=2, help='Optimization level. Currently supports values 0, 1 or 2')
+    parser.add_argument('--raise', '-r', action='store_true', default=False, help='Upon interpreter error, print exception with backtrace')
 
     # parse and validate arguments
     args = parser.parse_args()
@@ -294,14 +492,24 @@ def main():
     elif program is None:
         program = input("Input a brainfuck program: ")
 
+    if args.O > 2:
+        print(f'Warning: optimization level {args.O} not supported, using highest available instead')
+        args.O = 2
+    elif args.O < 0:
+        print(f'Error: Invalid optimization level {args.O}')
+        exit(1)
+
     # start interpreting
     start_time = perf_counter()
     try:
         print('[Started program execution]')
-        io_time = bf_interactive_buffered_execute(program, args.implementation, iter_limit=args.iter_limit, control_char=args.control_char)
+        io_time = bf_interactive_buffered_execute(program, args.implementation, iter_limit=args.iter_limit, control_char=args.control_char, optimization_level=args.O)
     except Exception as e:
         io_time = 0
         print(f'\n[Encountered error during execution: {e}. Terminating]')
+
+        if getattr(args, 'raise'): # same as args.raise, avoids syntax error
+            raise e
         exit(1)
     except KeyboardInterrupt:
         print(f'\n[Interrupted. Was executing for {perf_counter() - start_time:0.2f}s]')
